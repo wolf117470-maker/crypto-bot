@@ -23,8 +23,8 @@ API_SECRET = os.getenv("CDC_API_SECRET", "YOUR_API_SECRET_HERE")
 # Trading pairs - add more here as needed
 TRADING_PAIRS = [
     "ETH_USDT",
-    "TURBO_USDT",
-    # "SOL_USDT",   # Uncomment to add more
+    #"TURBO_USDT",
+     "AKT_USDT",   # Uncomment to add more
     # "XRP_USDT",
 ]
 
