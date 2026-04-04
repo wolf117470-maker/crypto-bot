@@ -23,8 +23,9 @@ ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_KEY")
 # Trading pairs - add/remove as needed
 TRADING_PAIRS = [
     "ETH_USDT",
-    # "TURBO_USDT",   # Re-enable once Exchange has candle history
+     "SOL_USDT",   # Re-enable once Exchange has candle history
     "AKT_USDT",
+    "BTC_USDT"
 ]
 
 TRADE_SIZE_USDT      = 20.0
