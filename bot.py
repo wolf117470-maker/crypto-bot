@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Crypto.com Trading Bot
-Pairs: ETH/USDT, TURBO/USDT (easily extensible)
-Strategy: RSI + Price Spike/Drop
+Crypto.com Trading Bot — AI Enhanced
+Strategy: RSI + Price Move triggers, Claude AI confirms/vetoes
+Data: Price history, RSI, Fear & Greed index, recent news
 """
 
 import hmac
@@ -13,87 +13,69 @@ import requests
 import logging
 import os
 from datetime import datetime
-from collections import deque
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-API_KEY = os.getenv("CDC_API_KEY", "YOUR_API_KEY_HERE")
-API_SECRET = os.getenv("CDC_API_SECRET", "YOUR_API_SECRET_HERE")
+CDC_API_KEY    = os.getenv("CDC_API_KEY", "YOUR_CDC_KEY")
+CDC_API_SECRET = os.getenv("CDC_API_SECRET", "YOUR_CDC_SECRET")
+ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_KEY")
 
-# Trading pairs - add more here as needed
+# Trading pairs - add/remove as needed
 TRADING_PAIRS = [
     "ETH_USDT",
-    #"TURBO_USDT",
-     "AKT_USDT",   # Uncomment to add more
-    # "XRP_USDT",
+    # "TURBO_USDT",   # Re-enable once Exchange has candle history
+    "AKT_USDT",
 ]
 
-# Trade size per signal (USDT)
-TRADE_SIZE_USDT = 20.0
+TRADE_SIZE_USDT      = 20.0
+RSI_PERIOD           = 14
+RSI_BUY_THRESHOLD    = 30
+RSI_SELL_THRESHOLD   = 70
+PRICE_DROP_PCT       = -5.0
+PRICE_SPIKE_PCT      = 5.0
+PRICE_WINDOW         = 6
+CANDLE_INTERVAL      = "5m"
+MIN_CANDLES          = 20       # Minimum candles before trading a pair
+POLL_INTERVAL        = 300      # 5 minutes
 
-# RSI settings
-RSI_PERIOD = 14
-RSI_BUY_THRESHOLD = 30      # Buy when RSI drops to/below this
-RSI_SELL_THRESHOLD = 70     # Sell when RSI rises to/above this
-
-# Price spike/drop alert thresholds (% change over PRICE_WINDOW candles)
-PRICE_DROP_PCT = -5.0       # Buy signal on drop >= this %
-PRICE_SPIKE_PCT = 5.0       # Sell signal on spike >= this %
-PRICE_WINDOW = 6            # Number of candles to measure change over
-
-# Candle interval: 1m, 5m, 15m, 1h, 4h, 1D
-CANDLE_INTERVAL = "5m"
-
-# HA notifications (set to True once you have remote access sorted)
+# HA notifications
 HA_NOTIFICATIONS_ENABLED = False
-HA_URL = os.getenv("HA_URL", "http://YOUR_HA_IP:8123")
-HA_TOKEN = os.getenv("HA_TOKEN", "YOUR_HA_LONG_LIVED_TOKEN")
-HA_NOTIFY_SERVICE = "notify.mobile_app_your_phone"  # Change to your device
+HA_URL             = os.getenv("HA_URL", "http://homeassistant.local:8123")
+HA_TOKEN           = os.getenv("HA_TOKEN", "")
+HA_NOTIFY_SERVICE  = "notify.mobile_app_your_phone"
 
 # Logging
-LOG_FILE = "bot.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 log = logging.getLogger(__name__)
+
+# Track holdings to avoid duplicate buys
+holdings = {pair: False for pair in TRADING_PAIRS}
 
 # ─── CRYPTO.COM API ───────────────────────────────────────────────────────────
 
 BASE_URL = "https://api.crypto.com/exchange/v1"
 
 def sign_request(method, params=None):
-    """Generate HMAC-SHA256 signature for Crypto.com Exchange API."""
-    if params is None:
-        params = {}
+    params = params or {}
     nonce = str(int(time.time() * 1000))
-    param_str = ""
-    if params:
-        param_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-
-    sig_payload = f"{method}{nonce}{API_KEY}{param_str}{nonce}"
-    sig = hmac.new(
-        API_SECRET.encode("utf-8"),
-        sig_payload.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+    param_str = "&".join(f"{k}={v}" for k, v in sorted(params.items())) if params else ""
+    sig_payload = f"{method}{nonce}{CDC_API_KEY}{param_str}{nonce}"
+    sig = hmac.new(CDC_API_SECRET.encode(), sig_payload.encode(), hashlib.sha256).hexdigest()
     return nonce, sig
 
 def api_request(endpoint, params=None, private=False):
-    """Make a request to the Crypto.com Exchange API."""
     url = f"{BASE_URL}/{endpoint}"
     headers = {"Content-Type": "application/json"}
-
     if private:
         nonce, sig = sign_request(endpoint, params or {})
         payload = {
             "id": int(time.time() * 1000),
             "method": endpoint,
-            "api_key": API_KEY,
+            "api_key": CDC_API_KEY,
             "params": params or {},
             "nonce": nonce,
             "sig": sig
@@ -101,7 +83,6 @@ def api_request(endpoint, params=None, private=False):
         resp = requests.post(url, headers=headers, json=payload, timeout=10)
     else:
         resp = requests.get(url, headers=headers, params=params or {}, timeout=10)
-
     resp.raise_for_status()
     data = resp.json()
     if data.get("code", 0) != 0:
@@ -109,146 +90,210 @@ def api_request(endpoint, params=None, private=False):
     return data
 
 def get_candles(pair, interval=CANDLE_INTERVAL, depth=50):
-    """Fetch OHLCV candle data for a pair."""
     data = api_request("public/get-candlestick", {
         "instrument_name": pair,
         "timeframe": interval,
         "count": depth
     })
-    candles = data["result"]["data"]
-    closes = [float(c["c"]) for c in candles]
-    return closes
+    return [float(c["c"]) for c in data["result"]["data"]]
 
 def get_balance(currency):
-    """Get available balance for a currency."""
-    data = api_request("private/get-account-summary", {
-        "currency": currency
-    }, private=True)
-    accounts = data["result"]["accounts"]
-    for acc in accounts:
+    data = api_request("private/get-account-summary", {"currency": currency}, private=True)
+    for acc in data["result"]["accounts"]:
         if acc["currency"] == currency:
             return float(acc["available"])
     return 0.0
 
 def place_market_order(pair, side, quantity):
-    """Place a market buy or sell order."""
     data = api_request("private/create-order", {
         "instrument_name": pair,
-        "side": side.upper(),   # BUY or SELL
+        "side": side.upper(),
         "type": "MARKET",
         "quantity": str(quantity),
     }, private=True)
-    order_id = data["result"]["order_id"]
-    log.info(f"Order placed: {side} {quantity} {pair} | ID: {order_id}")
-    return order_id
+    return data["result"]["order_id"]
 
-# ─── STRATEGY ─────────────────────────────────────────────────────────────────
+# ─── MARKET DATA ──────────────────────────────────────────────────────────────
+
+def get_fear_greed():
+    """Fetch the Crypto Fear & Greed Index."""
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
+        data = r.json()["data"][0]
+        return int(data["value"]), data["value_classification"]
+    except Exception as e:
+        log.warning(f"Fear & Greed fetch failed: {e}")
+        return None, "Unknown"
+
+def get_recent_news(coin):
+    """Fetch recent news headlines for a coin via DuckDuckGo."""
+    try:
+        symbol = coin.replace("_USDT", "")
+        r = requests.get(
+            f"https://api.duckduckgo.com/?q={symbol}+crypto+news&format=json&no_html=1&skip_disambig=1",
+            timeout=5
+        )
+        data = r.json()
+        topics = data.get("RelatedTopics", [])[:3]
+        headlines = []
+        for t in topics:
+            if "Text" in t:
+                headlines.append(t["Text"][:120])
+        return headlines if headlines else ["No recent news found"]
+    except Exception as e:
+        log.warning(f"News fetch failed: {e}")
+        return ["News unavailable"]
+
+# ─── RSI & SIGNALS ────────────────────────────────────────────────────────────
 
 def calculate_rsi(closes, period=RSI_PERIOD):
-    """Calculate RSI from a list of closing prices."""
     if len(closes) < period + 1:
         return None
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        diff = closes[-period + i - 1] - closes[-period + i - 2] if i > 1 else closes[-1] - closes[-2]
-        (gains if diff >= 0 else losses).append(abs(diff))
-
-    # Proper RSI calculation
     deltas = [closes[i] - closes[i-1] for i in range(len(closes)-period, len(closes))]
     gains = [d for d in deltas if d > 0]
     losses = [abs(d) for d in deltas if d < 0]
-
     avg_gain = sum(gains) / period if gains else 0
     avg_loss = sum(losses) / period if losses else 0.0001
-
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 def check_price_move(closes, window=PRICE_WINDOW):
-    """Check % price change over last N candles."""
     if len(closes) < window:
         return 0.0
-    old_price = closes[-window]
-    new_price = closes[-1]
-    return ((new_price - old_price) / old_price) * 100
+    return ((closes[-1] - closes[-window]) / closes[-window]) * 100
 
-def get_signal(pair):
-    """
-    Returns: 'BUY', 'SELL', or None
-    Based on RSI + price move combo.
-    """
+def get_rsi_signal(pair):
+    """Get RSI/price signal. Returns signal, closes, rsi, price_move."""
     try:
         closes = get_candles(pair)
+
+        # Skip if insufficient candle history
+        if len(closes) < MIN_CANDLES:
+            log.warning(f"{pair}: Only {len(closes)} candles — skipping (need {MIN_CANDLES})")
+            return None, closes, None, None
+
         rsi = calculate_rsi(closes)
         price_move = check_price_move(closes)
 
         log.info(f"{pair} | Price: {closes[-1]:.6f} | RSI: {rsi:.1f} | Move: {price_move:+.2f}%")
 
         if rsi is None:
-            return None, rsi, price_move
+            return None, closes, rsi, price_move
 
-        buy_signal = rsi <= RSI_BUY_THRESHOLD or price_move <= PRICE_DROP_PCT
-        sell_signal = rsi >= RSI_SELL_THRESHOLD or price_move >= PRICE_SPIKE_PCT
-
-        if buy_signal:
+        if rsi <= RSI_BUY_THRESHOLD or price_move <= PRICE_DROP_PCT:
             reason = f"RSI={rsi:.1f}" if rsi <= RSI_BUY_THRESHOLD else f"Drop={price_move:.1f}%"
-            return "BUY", rsi, price_move, reason
-        elif sell_signal:
+            return "BUY", closes, rsi, price_move
+        elif rsi >= RSI_SELL_THRESHOLD or price_move >= PRICE_SPIKE_PCT:
             reason = f"RSI={rsi:.1f}" if rsi >= RSI_SELL_THRESHOLD else f"Spike={price_move:.1f}%"
-            return "SELL", rsi, price_move, reason
+            return "SELL", closes, rsi, price_move
 
-        return None, rsi, price_move, None
+        return None, closes, rsi, price_move
 
     except Exception as e:
         log.error(f"Signal error for {pair}: {e}")
-        return None, None, None, None
+        return None, [], None, None
 
-# ─── HOME ASSISTANT NOTIFICATIONS ─────────────────────────────────────────────
+# ─── AI ANALYSIS ──────────────────────────────────────────────────────────────
+
+def ai_confirm_signal(pair, signal, closes, rsi, price_move, fear_greed_val, fear_greed_label, news):
+    """Ask Claude to confirm or veto the RSI signal."""
+    symbol = pair.replace("_USDT", "")
+    recent_prices = closes[-10:]
+    price_change_24h = ((closes[-1] - closes[-48]) / closes[-48] * 100) if len(closes) >= 48 else None
+
+    prompt = f"""You are a crypto trading assistant. A rule-based RSI bot has triggered a {signal} signal for {symbol}/USDT.
+
+MARKET DATA:
+- Current price: ${closes[-1]:.6f}
+- RSI (14): {rsi:.1f}
+- Price move (last 30 min): {price_move:+.2f}%
+- 24h price change: {f'{price_change_24h:+.2f}%' if price_change_24h else 'N/A'}
+- Last 10 closes: {[round(p, 6) for p in recent_prices]}
+
+SENTIMENT:
+- Crypto Fear & Greed Index: {fear_greed_val}/100 ({fear_greed_label})
+
+RECENT NEWS:
+{chr(10).join(f'- {h}' for h in news)}
+
+The bot wants to {signal} ${20} USD worth of {symbol}.
+
+Analyse this trade. Consider:
+1. Does the RSI signal make sense given the price action?
+2. Does market sentiment support this trade?
+3. Are there any news red flags?
+4. Is this a good risk/reward right now?
+
+Respond in this exact format:
+DECISION: [CONFIRM or VETO]
+CONFIDENCE: [HIGH, MEDIUM, or LOW]
+REASONING: [2-3 sentences max explaining your decision]"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=15
+        )
+        resp.raise_for_status()
+        text = resp.json()["content"][0]["text"].strip()
+        log.info(f"AI Analysis for {pair}:\n{text}")
+
+        confirmed = "DECISION: CONFIRM" in text
+        confidence = "HIGH" if "CONFIDENCE: HIGH" in text else "MEDIUM" if "CONFIDENCE: MEDIUM" in text else "LOW"
+        reasoning = ""
+        for line in text.split("\n"):
+            if line.startswith("REASONING:"):
+                reasoning = line.replace("REASONING:", "").strip()
+
+        return confirmed, confidence, reasoning
+
+    except Exception as e:
+        log.error(f"AI analysis failed: {e}")
+        log.warning("AI unavailable — falling back to RSI signal only")
+        return True, "LOW", "AI unavailable, proceeding on RSI signal"
+
+# ─── HA NOTIFICATIONS ─────────────────────────────────────────────────────────
 
 def send_ha_notification(title, message):
-    """Send a push notification via Home Assistant."""
     if not HA_NOTIFICATIONS_ENABLED:
         log.info(f"[HA NOTIFY DISABLED] {title}: {message}")
         return
     try:
         url = f"{HA_URL}/api/services/notify/{HA_NOTIFY_SERVICE.split('.')[-1]}"
-        headers = {
-            "Authorization": f"Bearer {HA_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        payload = {"title": title, "message": message}
-        resp = requests.post(url, headers=headers, json=payload, timeout=5)
-        resp.raise_for_status()
+        headers = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
+        requests.post(url, headers=headers, json={"title": title, "message": message}, timeout=5).raise_for_status()
         log.info(f"HA notification sent: {title}")
     except Exception as e:
         log.warning(f"HA notification failed: {e}")
 
 # ─── TRADE EXECUTION ──────────────────────────────────────────────────────────
 
-# Track what we're holding to avoid duplicate buys
-holdings = {pair: False for pair in TRADING_PAIRS}
-
-def execute_trade(pair, signal, reason):
-    """Execute a trade based on signal."""
-    base_currency = pair.split("_")[0]   # e.g. ETH
-    quote_currency = pair.split("_")[1]  # e.g. USDT
-
+def execute_trade(pair, signal, closes, rsi, price_move, ai_reasoning, ai_confidence):
+    base_currency = pair.split("_")[0]
     try:
         if signal == "BUY":
+            if holdings.get(pair):
+                log.info(f"Already holding {pair} — skipping BUY")
+                return
             usdt_balance = get_balance("USDT")
             if usdt_balance < TRADE_SIZE_USDT:
-                log.warning(f"Insufficient USDT for {pair} buy. Have {usdt_balance:.2f}")
+                log.warning(f"Insufficient USDT for {pair}. Have {usdt_balance:.2f}")
                 return
-
-            # Get current price to calculate quantity
-            closes = get_candles(pair, depth=5)
             price = closes[-1]
             quantity = round(TRADE_SIZE_USDT / price, 6)
-
             order_id = place_market_order(pair, "BUY", quantity)
             holdings[pair] = True
-
-            msg = f"🟢 BUY {quantity} {base_currency} @ ~{price:.6f}\nReason: {reason}\nOrder: {order_id}"
+            msg = f"🟢 BUY {quantity} {base_currency} @ ~{price:.6f}\nRSI: {rsi:.1f} | AI: {ai_confidence}\n{ai_reasoning}\nOrder: {order_id}"
             log.info(msg)
             send_ha_notification(f"Bot: BUY {base_currency}", msg)
 
@@ -257,15 +302,11 @@ def execute_trade(pair, signal, reason):
             if base_balance <= 0:
                 log.warning(f"Nothing to sell for {pair}")
                 return
-
-            # Sell full balance of that coin
             quantity = round(base_balance, 6)
             order_id = place_market_order(pair, "SELL", quantity)
             holdings[pair] = False
-
-            closes = get_candles(pair, depth=5)
             price = closes[-1]
-            msg = f"🔴 SELL {quantity} {base_currency} @ ~{price:.6f}\nReason: {reason}\nOrder: {order_id}"
+            msg = f"🔴 SELL {quantity} {base_currency} @ ~{price:.6f}\nRSI: {rsi:.1f} | AI: {ai_confidence}\n{ai_reasoning}\nOrder: {order_id}"
             log.info(msg)
             send_ha_notification(f"Bot: SELL {base_currency}", msg)
 
@@ -275,39 +316,57 @@ def execute_trade(pair, signal, reason):
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
-POLL_INTERVAL_SECONDS = 300  # 5 minutes (matches 5m candles)
-
 def main():
-    log.info("=" * 50)
-    log.info("Crypto.com Trading Bot Starting")
+    log.info("=" * 55)
+    log.info("Crypto.com AI Trading Bot Starting")
     log.info(f"Pairs: {', '.join(TRADING_PAIRS)}")
-    log.info(f"Strategy: RSI({RSI_BUY_THRESHOLD}/{RSI_SELL_THRESHOLD}) + Price Move({PRICE_DROP_PCT}%/{PRICE_SPIKE_PCT}%)")
-    log.info(f"Trade size: {TRADE_SIZE_USDT} USDT")
+    log.info(f"Strategy: RSI({RSI_BUY_THRESHOLD}/{RSI_SELL_THRESHOLD}) + Price Move + Claude AI")
+    log.info(f"Trade size: {TRADE_SIZE_USDT} USDT | Min candles: {MIN_CANDLES}")
     log.info(f"HA Notifications: {'ENABLED' if HA_NOTIFICATIONS_ENABLED else 'DISABLED'}")
-    log.info("=" * 50)
+    log.info("=" * 55)
 
-    send_ha_notification("Trading Bot Started", f"Watching: {', '.join(TRADING_PAIRS)}")
+    send_ha_notification("AI Trading Bot Started", f"Watching: {', '.join(TRADING_PAIRS)}")
 
     while True:
         try:
+            # Fetch shared market data once per cycle
+            fear_val, fear_label = get_fear_greed()
+            log.info(f"Fear & Greed: {fear_val}/100 ({fear_label})")
+
             for pair in TRADING_PAIRS:
-                result = get_signal(pair)
-                signal = result[0]
-                reason = result[3] if len(result) > 3 else None
+                signal, closes, rsi, price_move = get_rsi_signal(pair)
 
-                if signal:
-                    log.info(f"Signal: {signal} on {pair} ({reason})")
-                    execute_trade(pair, signal, reason)
+                if signal and rsi is not None:
+                    log.info(f"RSI Signal: {signal} on {pair} — consulting AI...")
 
-            log.info(f"Cycle complete. Sleeping {POLL_INTERVAL_SECONDS}s...\n")
-            time.sleep(POLL_INTERVAL_SECONDS)
+                    # Get news for this coin
+                    news = get_recent_news(pair)
+
+                    # Ask Claude to confirm or veto
+                    confirmed, confidence, reasoning = ai_confirm_signal(
+                        pair, signal, closes, rsi, price_move,
+                        fear_val, fear_label, news
+                    )
+
+                    if confirmed:
+                        log.info(f"AI CONFIRMED {signal} on {pair} ({confidence}) — executing")
+                        execute_trade(pair, signal, closes, rsi, price_move, reasoning, confidence)
+                    else:
+                        log.info(f"AI VETOED {signal} on {pair} ({confidence}): {reasoning}")
+                        send_ha_notification(
+                            f"Bot: {signal} VETOED {pair.split('_')[0]}",
+                            f"AI blocked the trade.\n{reasoning}"
+                        )
+
+            log.info(f"Cycle complete. Sleeping {POLL_INTERVAL}s...\n")
+            time.sleep(POLL_INTERVAL)
 
         except KeyboardInterrupt:
-            log.info("Bot stopped by user.")
+            log.info("Bot stopped.")
             break
         except Exception as e:
             log.error(f"Main loop error: {e}")
-            time.sleep(30)  # Short sleep on error before retrying
+            time.sleep(30)
 
 if __name__ == "__main__":
     main()
