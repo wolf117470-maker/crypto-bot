@@ -24,7 +24,7 @@ ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_KEY")
 TRADING_PAIRS = [
     "ETH_USDT",
      "SOL_USDT",   # Re-enable once Exchange has candle history
-    "AKT_USDT",
+    #"AKT_USDT",
     "BTC_USDT"
 ]
 
